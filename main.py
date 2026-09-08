@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFileDialog, QPlainTextEdit,
     QMessageBox, QGroupBox
 )
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QFont
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLineEdit as _QLE  # for EchoMode enum access
 
 import keyring
 
 from clone_worker import CloneWorker
+from style import DARK_THEME
 
 KEYRING_SERVICE = "repo-clone-tool"
 KEYRING_USERNAME = "github-pat"
@@ -31,40 +33,64 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GitEase")
-        self.resize(720, 560)
+        self.resize(760, 620)
+        self.setMinimumSize(600, 480)
 
         self.worker = None
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        # --- Header ---
+        title_label = QLabel("GitEase")
+        title_font = QFont()
+        title_font.setPointSize(20)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        subtitle_label = QLabel("Clone a GitHub repo and connect it locally -- no terminal needed.")
+        subtitle_label.setStyleSheet("color: #8b949e; font-weight: 400;")
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addSpacing(6)
 
         # --- Repo URL ---
-        url_layout = QHBoxLayout()
-        url_layout.addWidget(QLabel("GitHub repo URL:"))
+        url_label = QLabel("GITHUB REPO URL")
+        url_label.setObjectName("sectionLabel")
+        layout.addWidget(url_label)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://github.com/user/repo.git")
-        url_layout.addWidget(self.url_input)
-        layout.addLayout(url_layout)
+        self.url_input.setMinimumHeight(34)
+        layout.addWidget(self.url_input)
 
         # --- Destination folder ---
+        dest_label = QLabel("DESTINATION FOLDER")
+        dest_label.setObjectName("sectionLabel")
+        layout.addWidget(dest_label)
         dest_layout = QHBoxLayout()
-        dest_layout.addWidget(QLabel("Destination folder:"))
+        dest_layout.setSpacing(8)
         self.dest_input = QLineEdit()
+        self.dest_input.setMinimumHeight(34)
         dest_layout.addWidget(self.dest_input)
         browse_btn = QPushButton("Browse...")
+        browse_btn.setMinimumHeight(34)
         browse_btn.clicked.connect(self.browse_folder)
         dest_layout.addWidget(browse_btn)
         layout.addLayout(dest_layout)
 
         # --- Auth (optional) ---
-        token_group = QGroupBox("GitHub token (optional -- only needed for private repos)")
+        token_group = QGroupBox("GitHub Token  ·  optional, only needed for private repos")
         token_layout = QHBoxLayout()
+        token_layout.setSpacing(8)
         self.token_input = QLineEdit()
         self.token_input.setEchoMode(_QLE.Password)
         self.token_input.setPlaceholderText("Personal Access Token")
+        self.token_input.setMinimumHeight(32)
         token_layout.addWidget(self.token_input)
-        save_token_btn = QPushButton("Save token")
+        save_token_btn = QPushButton("Save")
+        save_token_btn.setMinimumHeight(32)
         save_token_btn.clicked.connect(self.save_token)
         token_layout.addWidget(save_token_btn)
         token_group.setLayout(token_layout)
@@ -72,12 +98,16 @@ class MainWindow(QMainWindow):
 
         # --- Action button ---
         self.clone_btn = QPushButton("Clone && Connect")
-        self.clone_btn.setMinimumHeight(36)
+        self.clone_btn.setObjectName("primaryButton")
+        self.clone_btn.setMinimumHeight(42)
+        self.clone_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clone_btn.clicked.connect(self.start_clone)
         layout.addWidget(self.clone_btn)
 
         # --- Log view ---
-        layout.addWidget(QLabel("Log:"))
+        log_label = QLabel("LOG")
+        log_label.setObjectName("sectionLabel")
+        layout.addWidget(log_label)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
@@ -169,6 +199,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyleSheet(DARK_THEME)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
