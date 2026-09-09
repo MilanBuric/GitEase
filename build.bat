@@ -1,5 +1,5 @@
 @echo off
-REM Builds GitEase into a single standalone .exe using PyInstaller.
+REM Builds GitEase into a single standalone .exe using PyInstaller, with the app icon.
 REM Run this from the GitEase folder, with the venv already created.
 
 echo Installing PyInstaller (if not already installed)...
@@ -7,7 +7,7 @@ venv\Scripts\pip install pyinstaller
 
 echo.
 echo Building GitEase.exe ...
-venv\Scripts\pyinstaller --noconfirm --onefile --windowed --name GitEase main.py
+venv\Scripts\pyinstaller --noconfirm --onefile --windowed --name GitEase --icon icon.ico --add-data "icon.ico;." main.py
 
 echo.
 echo Done! Your executable is at: dist\GitEase.exe

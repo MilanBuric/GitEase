@@ -1,0 +1,42 @@
+name: Build and Release GitEase
+
+# Runs automatically whenever a tag like "v1.0.0" is pushed.
+# Builds a Windows .exe and attaches it to a new GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name GitEase --icon icon.ico main.py
+
+      - name: Run tests
+        run: |
+          pip install pytest
+          pytest tests/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/GitEase.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
