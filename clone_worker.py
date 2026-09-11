@@ -36,11 +36,12 @@ class CloneWorker(QThread):
     finished_ok = Signal(str)   # emits the local path on success
     failed = Signal(str)        # emits a human-readable error message
 
-    def __init__(self, url, dest_path, token=None):
+    def __init__(self, url, dest_path, token=None, branch=None):
         super().__init__()
         self.url = url
         self.dest_path = dest_path
         self.token = token
+        self.branch = branch  # None = clone the repo's default branch
 
     def _authed_url(self):
         """Injects the PAT into an https:// URL so private repos can be cloned.
@@ -60,6 +61,8 @@ class CloneWorker(QThread):
         try:
             self.log_message.emit(f"Target URL: {self.url}")
             self.log_message.emit(f"Destination: {self.dest_path}")
+            if self.branch:
+                self.log_message.emit(f"Branch: {self.branch}")
 
             if os.path.exists(self.dest_path) and os.listdir(self.dest_path):
                 raise ValueError(
@@ -67,7 +70,10 @@ class CloneWorker(QThread):
                 )
 
             progress = CloneProgress(self.log_message)
-            repo = Repo.clone_from(self._authed_url(), self.dest_path, progress=progress)
+            clone_kwargs = {"progress": progress}
+            if self.branch:
+                clone_kwargs["branch"] = self.branch
+            repo = Repo.clone_from(self._authed_url(), self.dest_path, **clone_kwargs)
 
             # git clone already sets up 'origin' automatically -- this just
             # confirms it and surfaces the (token-free) remote URL in the log.
