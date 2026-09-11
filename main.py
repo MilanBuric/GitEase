@@ -1,24 +1,25 @@
 """
 GitEase
 ----------------
-Clone, pull, view status across, and commit/push GitHub repos -- no
-terminal needed. See README.md for the full feature list.
+Clone, pull, view status across, and commit/push GitHub/GitLab/Bitbucket
+repos -- no terminal needed. See README.md for the full feature list.
 """
 
 import sys
 import os
+import platform
+import subprocess
 import webbrowser
 from datetime import datetime
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QPlainTextEdit,
-    QMessageBox, QGroupBox, QComboBox, QTabWidget, QTableWidget,
-    QTableWidgetItem, QHeaderView, QTextEdit, QInputDialog
+    QMessageBox, QComboBox, QTabWidget, QTableWidget,
+    QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar
 )
 from PySide6.QtGui import QTextCursor, QFont, QIcon
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtWidgets import QLineEdit as _QLE  # for EchoMode enum access
 
 import keyring
 
@@ -27,7 +28,8 @@ from pull_worker import PullWorker
 from branch_worker import BranchListWorker
 from repo_registry import RepoRegistry, RepoStatusWorker
 from commit_push_worker import CommitPushWorker
-from github_oauth import DeviceFlowLogin
+from settings_dialog import SettingsDialog
+from git_providers import detect_provider
 from style import DARK_THEME
 
 KEYRING_SERVICE = "repo-clone-tool"
@@ -43,12 +45,24 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
+def open_in_file_manager(path):
+    """Opens a folder in the OS's file manager -- Explorer on Windows,
+    Finder on macOS, whatever the desktop's default is on Linux."""
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(path)  # noqa: only exists on Windows, guarded by the check above
+    elif system == "Darwin":
+        subprocess.run(["open", path], check=False)
+    else:
+        subprocess.run(["xdg-open", path], check=False)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GitEase")
-        self.resize(880, 760)
-        self.setMinimumSize(680, 560)
+        self.resize(880, 780)
+        self.setMinimumSize(680, 580)
 
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path):
@@ -59,9 +73,9 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.branch_worker = None
         self.status_worker = None
-        self.login_worker = None
         self._last_cloned_path = None
         self._detected_branches = []
+        self.current_token = ""
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -70,15 +84,26 @@ class MainWindow(QMainWindow):
         outer_layout.setSpacing(12)
 
         # --- Header ---
+        header_row = QHBoxLayout()
+        title_col = QVBoxLayout()
         title_label = QLabel("GitEase")
         title_font = QFont()
         title_font.setPointSize(20)
         title_font.setBold(True)
         title_label.setFont(title_font)
-        subtitle_label = QLabel("Clone, pull, track, and push GitHub repos -- no terminal needed.")
+        subtitle_label = QLabel("Clone, pull, track, and push repos -- no terminal needed.")
         subtitle_label.setStyleSheet("color: #8b949e; font-weight: 400;")
-        outer_layout.addWidget(title_label)
-        outer_layout.addWidget(subtitle_label)
+        title_col.addWidget(title_label)
+        title_col.addWidget(subtitle_label)
+        header_row.addLayout(title_col)
+        header_row.addStretch(1)
+
+        settings_btn = QPushButton("\u2699 Settings")
+        settings_btn.setMinimumHeight(34)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.clicked.connect(self.open_settings)
+        header_row.addWidget(settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        outer_layout.addLayout(header_row)
         outer_layout.addSpacing(4)
 
         # --- Tabs ---
@@ -102,16 +127,25 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # --- Log view (shared by all tabs) ---
+        log_header_row = QHBoxLayout()
         log_label = QLabel("LOG")
         log_label.setObjectName("sectionLabel")
-        outer_layout.addWidget(log_label)
+        log_header_row.addWidget(log_label)
+        log_header_row.addStretch(1)
+        clear_log_btn = QPushButton("Clear")
+        clear_log_btn.setMinimumHeight(22)
+        clear_log_btn.setMaximumWidth(70)
+        clear_log_btn.clicked.connect(self.clear_log)
+        log_header_row.addWidget(clear_log_btn)
+        outer_layout.addLayout(log_header_row)
+
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
         self.log_view.setMaximumHeight(160)
         outer_layout.addWidget(self.log_view)
 
-        self.load_saved_token()
+        self._load_token_silently()
         self._refresh_recent_combo()
         self._refresh_dashboard()
 
@@ -129,7 +163,7 @@ class MainWindow(QMainWindow):
         self.recent_combo.currentIndexChanged.connect(self._on_recent_selected)
         layout.addWidget(self.recent_combo)
 
-        url_label = QLabel("GITHUB REPO URL")
+        url_label = QLabel("REPO URL  (GitHub, GitLab, or Bitbucket)")
         url_label.setObjectName("sectionLabel")
         layout.addWidget(url_label)
         url_row = QHBoxLayout()
@@ -137,12 +171,17 @@ class MainWindow(QMainWindow):
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://github.com/user/repo.git")
         self.url_input.setMinimumHeight(34)
+        self.url_input.textChanged.connect(self._update_provider_label)
         url_row.addWidget(self.url_input)
         list_branches_btn = QPushButton("List Branches")
         list_branches_btn.setMinimumHeight(34)
         list_branches_btn.clicked.connect(self.fetch_branches)
         url_row.addWidget(list_branches_btn)
         layout.addLayout(url_row)
+
+        self.provider_label = QLabel("")
+        self.provider_label.setStyleSheet("color: #8b949e; font-weight: 400;")
+        layout.addWidget(self.provider_label)
 
         branch_label = QLabel("BRANCH")
         branch_label.setObjectName("sectionLabel")
@@ -166,28 +205,12 @@ class MainWindow(QMainWindow):
         dest_layout.addWidget(browse_btn)
         layout.addLayout(dest_layout)
 
-        token_group = QGroupBox("GitHub Authentication  ·  optional, only needed for private repos")
-        token_layout = QVBoxLayout()
-        token_layout.setSpacing(8)
-        token_row = QHBoxLayout()
-        token_row.setSpacing(8)
-        self.token_input = QLineEdit()
-        self.token_input.setEchoMode(_QLE.Password)
-        self.token_input.setPlaceholderText("Personal Access Token")
-        self.token_input.setMinimumHeight(32)
-        token_row.addWidget(self.token_input)
-        save_token_btn = QPushButton("Save")
-        save_token_btn.setMinimumHeight(32)
-        save_token_btn.clicked.connect(self.save_token)
-        token_row.addWidget(save_token_btn)
-        token_layout.addLayout(token_row)
-
-        signin_btn = QPushButton("Sign in with GitHub instead")
-        signin_btn.setMinimumHeight(32)
-        signin_btn.clicked.connect(self.start_github_signin)
-        token_layout.addWidget(signin_btn)
-        token_group.setLayout(token_layout)
-        layout.addWidget(token_group)
+        self.clone_progress = QProgressBar()
+        self.clone_progress.setRange(0, 100)
+        self.clone_progress.setValue(0)
+        self.clone_progress.setTextVisible(True)
+        self.clone_progress.setVisible(False)
+        layout.addWidget(self.clone_progress)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
@@ -207,6 +230,17 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
+    def _update_provider_label(self):
+        url = self.url_input.text().strip()
+        if not url:
+            self.provider_label.setText("")
+            return
+        provider = detect_provider(url)
+        if provider == "Unknown":
+            self.provider_label.setText("")
+        else:
+            self.provider_label.setText(f"Detected: {provider}")
+
     # ================= Pull tab =================
     def _build_pull_tab(self):
         layout = QVBoxLayout(self.pull_tab)
@@ -215,7 +249,7 @@ class MainWindow(QMainWindow):
 
         info_label = QLabel(
             "Point GitEase at a folder you've already cloned to fetch and merge\n"
-            "the latest changes from its GitHub remote."
+            "the latest changes from its remote."
         )
         info_label.setStyleSheet("color: #8b949e; font-weight: 400;")
         layout.addWidget(info_label)
@@ -333,66 +367,33 @@ class MainWindow(QMainWindow):
         if self.tabs.widget(index) is self.dashboard_tab:
             self._refresh_dashboard()
 
-    # ---------------- Token handling ----------------
-    def load_saved_token(self):
+    # ---------------- Settings / token handling ----------------
+    def _load_token_silently(self):
         try:
             token = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
             if token:
-                self.token_input.setText(token)
-                self.append_log("Loaded saved GitHub token from the system keyring.")
+                self.current_token = token
+                self.append_log("Loaded saved token from the system keyring.")
         except Exception as e:
             self.append_log(f"Could not load saved token: {e}")
 
-    def save_token(self):
-        token = self.token_input.text().strip()
-        if not token:
-            QMessageBox.warning(self, "No token", "Enter a token before saving.")
-            return
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
-            self.append_log("Token saved to the system keyring.")
-        except Exception as e:
-            self.append_log(f"ERROR saving token: {e}")
+    def open_settings(self):
+        dialog = SettingsDialog(self.current_token, self)
+        dialog.token_changed.connect(self._on_token_changed)
+        dialog.exec()
 
-    def start_github_signin(self):
-        self.login_worker = DeviceFlowLogin()
-        self.login_worker.code_ready.connect(self._on_login_code_ready)
-        self.login_worker.success.connect(self._on_login_success)
-        self.login_worker.failed.connect(self._on_login_failed)
-        self.append_log("Starting GitHub sign-in...")
-        self.login_worker.start()
-
-    def _on_login_code_ready(self, user_code, verification_uri):
-        self.append_log(f"Go to {verification_uri} and enter code: {user_code}")
-        webbrowser.open(verification_uri)
-        QMessageBox.information(
-            self, "Sign in with GitHub",
-            f"Your browser should have opened {verification_uri}.\n\n"
-            f"Enter this code there:\n\n{user_code}\n\n"
-            "This window will update automatically once you approve access."
-        )
-
-    def _on_login_success(self, token):
-        self.token_input.setText(token)
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
-            self.append_log("Signed in with GitHub -- token saved to the system keyring.")
-        except Exception as e:
-            self.append_log(f"Signed in, but could not save token: {e}")
-
-    def _on_login_failed(self, msg):
-        self.append_log(f"GitHub sign-in failed: {msg}")
-        QMessageBox.warning(self, "Sign-in unavailable", msg)
+    def _on_token_changed(self, token):
+        self.current_token = token
+        self.append_log("Token updated.")
 
     # ---------------- Branch listing ----------------
     def fetch_branches(self):
         url = self.url_input.text().strip()
         if not url:
-            QMessageBox.warning(self, "Missing URL", "Enter a GitHub repository URL first.")
+            QMessageBox.warning(self, "Missing URL", "Enter a repository URL first.")
             return
-        token = self.token_input.text().strip() or None
         self.append_log(f"Looking up branches for {url} ...")
-        self.branch_worker = BranchListWorker(url, token)
+        self.branch_worker = BranchListWorker(url, self.current_token or None)
         self.branch_worker.branches_ready.connect(self._on_branches_ready)
         self.branch_worker.failed.connect(self._on_branches_failed)
         self.branch_worker.start()
@@ -466,7 +467,7 @@ class MainWindow(QMainWindow):
 
     def open_last_cloned_folder(self):
         if self._last_cloned_path and os.path.isdir(self._last_cloned_path):
-            os.startfile(self._last_cloned_path)  # Windows-only, matches target platform
+            open_in_file_manager(self._last_cloned_path)
         else:
             QMessageBox.warning(self, "No folder", "No successfully cloned folder to open yet.")
 
@@ -476,18 +477,21 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(f"[{timestamp}] {text}")
         self.log_view.moveCursor(QTextCursor.MoveOperation.End)
 
+    def clear_log(self):
+        self.log_view.clear()
+
     # ---------------- Clone flow ----------------
     def start_clone(self):
         url = self.url_input.text().strip()
         dest = self.dest_input.text().strip()
-        token = self.token_input.text().strip() or None
+        token = self.current_token or None
 
         branch = None
         if self.branch_combo.currentIndex() > 0:
             branch = self.branch_combo.currentText()
 
         if not url:
-            QMessageBox.warning(self, "Missing URL", "Please enter a GitHub repository URL.")
+            QMessageBox.warning(self, "Missing URL", "Please enter a repository URL.")
             return
         if not dest:
             QMessageBox.warning(self, "Missing destination", "Please choose a destination folder.")
@@ -495,11 +499,14 @@ class MainWindow(QMainWindow):
 
         self.clone_btn.setEnabled(False)
         self.clone_btn.setText("Cloning...")
+        self.clone_progress.setValue(0)
+        self.clone_progress.setVisible(True)
         self.append_log("=" * 60)
         self.append_log(f"Clone requested: {url} -> {dest}")
 
         self.worker = CloneWorker(url, dest, token, branch)
         self.worker.log_message.connect(self.append_log)
+        self.worker.progress_percent.connect(self.clone_progress.setValue)
         self.worker.finished_ok.connect(lambda path: self.on_clone_success(path, url))
         self.worker.failed.connect(self.on_clone_failed)
         self.worker.start()
@@ -507,6 +514,7 @@ class MainWindow(QMainWindow):
     def on_clone_success(self, path, url):
         self.clone_btn.setEnabled(True)
         self.clone_btn.setText("Clone && Connect")
+        self.clone_progress.setVisible(False)
         self._last_cloned_path = path
         self.open_folder_btn.setEnabled(True)
         self._add_recent_url(url)
@@ -517,6 +525,7 @@ class MainWindow(QMainWindow):
     def on_clone_failed(self, error_msg):
         self.clone_btn.setEnabled(True)
         self.clone_btn.setText("Clone && Connect")
+        self.clone_progress.setVisible(False)
         QMessageBox.critical(
             self, "Clone failed",
             f"Something went wrong:\n\n{error_msg}\n\nScroll the log above for full details."

@@ -8,6 +8,8 @@ from PySide6.QtCore import QThread, Signal
 from git import Git
 from git.exc import GitCommandError
 
+from git_providers import build_authed_url
+
 
 class BranchListWorker(QThread):
     branches_ready = Signal(list, str)   # branch names, default branch name
@@ -19,9 +21,7 @@ class BranchListWorker(QThread):
         self.token = token
 
     def _authed_url(self):
-        if self.token and self.url.startswith("https://"):
-            return self.url.replace("https://", f"https://{self.token}@", 1)
-        return self.url
+        return build_authed_url(self.url, self.token)
 
     def run(self):
         try:
