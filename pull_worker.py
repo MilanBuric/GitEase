@@ -12,7 +12,7 @@ from git.exc import GitCommandError
 
 class PullWorker(QThread):
     log_message = Signal(str)
-    finished_ok = Signal(str)   # emits a short summary on success
+    finished_ok = Signal(str, str)   # emits (local path, origin URL) on success
     failed = Signal(str)
 
     def __init__(self, repo_path):
@@ -44,7 +44,7 @@ class PullWorker(QThread):
                 self.log_message.emit(f"Updated ref: {info.ref}  ({info.note or 'ok'})")
 
             self.log_message.emit("Pull complete -- local repo is up to date.")
-            self.finished_ok.emit(self.repo_path)
+            self.finished_ok.emit(self.repo_path, origin.url)
 
         except InvalidGitRepositoryError:
             msg = f"Not a git repository: {self.repo_path}"

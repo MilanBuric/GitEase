@@ -266,6 +266,11 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
+        add_existing_btn = QPushButton("Add Existing Folder")
+        add_existing_btn.setMinimumHeight(38)
+        add_existing_btn.clicked.connect(self.add_existing_folder)
+        btn_row.addWidget(add_existing_btn)
+
         refresh_btn = QPushButton("Refresh Status")
         refresh_btn.setMinimumHeight(38)
         refresh_btn.clicked.connect(self._refresh_dashboard)
@@ -535,10 +540,12 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.on_pull_failed)
         self.worker.start()
 
-    def on_pull_success(self, path):
+    def on_pull_success(self, path, origin_url):
         self.pull_btn.setEnabled(True)
         self.pull_btn.setText("Pull Latest Changes")
         self.registry.add_path(path)
+        if origin_url:
+            self._add_recent_url(origin_url)
         QMessageBox.information(self, "Up to date", f"Pulled the latest changes into:\n{path}")
 
     def on_pull_failed(self, error_msg):
@@ -620,10 +627,24 @@ class MainWindow(QMainWindow):
         self.append_log(f"Pulling: {path}")
         worker = PullWorker(path)
         worker.log_message.connect(self.append_log)
-        worker.finished_ok.connect(lambda _p: self._pull_next_in_queue())
+        worker.finished_ok.connect(lambda _p, _u: self._pull_next_in_queue())
         worker.failed.connect(lambda _msg: self._pull_next_in_queue())
         self.worker = worker  # keep a reference so it isn't garbage-collected mid-run
         worker.start()
+
+    def add_existing_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose an existing local repo folder")
+        if not folder:
+            return
+        if not os.path.isdir(os.path.join(folder, ".git")):
+            QMessageBox.warning(
+                self, "Not a git repository",
+                f"This folder doesn't look like a git repository (no .git folder found):\n{folder}"
+            )
+            return
+        self.registry.add_path(folder)
+        self.append_log(f"Added existing repo to Dashboard: {folder}")
+        self._refresh_dashboard()
 
     def remove_selected_repo(self):
         selected = self.dashboard_table.selectedItems()
