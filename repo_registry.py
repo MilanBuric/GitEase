@@ -22,22 +22,35 @@ class RepoRegistry:
     def __init__(self):
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
+    @staticmethod
+    def _normalize(path):
+        """Collapses backslash/forward-slash and case differences so the same
+        folder is never tracked twice under two different-looking paths."""
+        return os.path.normcase(os.path.normpath(path))
+
     def get_paths(self):
-        paths = self.settings.value(REGISTRY_KEY, [], type=list) or []
-        # Silently drop entries whose folder no longer exists.
-        valid = [p for p in paths if os.path.isdir(p)]
-        if valid != paths:
+        raw_paths = self.settings.value(REGISTRY_KEY, [], type=list) or []
+        # De-duplicate by normalized path, keeping the first-seen original spelling.
+        seen = {}
+        for p in raw_paths:
+            key = self._normalize(p)
+            if key not in seen and os.path.isdir(p):
+                seen[key] = p
+        valid = list(seen.values())
+        if valid != raw_paths:
             self.settings.setValue(REGISTRY_KEY, valid)
         return valid
 
     def add_path(self, path):
         paths = self.get_paths()
-        if path not in paths:
+        key = self._normalize(path)
+        if not any(self._normalize(p) == key for p in paths):
             paths.append(path)
             self.settings.setValue(REGISTRY_KEY, paths)
 
     def remove_path(self, path):
-        paths = [p for p in self.get_paths() if p != path]
+        key = self._normalize(path)
+        paths = [p for p in self.get_paths() if self._normalize(p) != key]
         self.settings.setValue(REGISTRY_KEY, paths)
 
 
