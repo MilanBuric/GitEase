@@ -2,11 +2,20 @@
 GitEase
 ----------------
 Clone, pull, view status across, and commit/push GitHub/GitLab/Bitbucket
-repos -- no terminal needed. See README.md for the full feature list.
+repos -- no terminal needed. See README.md for the full feature list and
+KNOWN_LIMITATIONS.md for what this app deliberately does NOT try to handle.
 """
 
 import sys
 import os
+
+# Must be set before any git subprocess runs: without this, git falls back
+# to an interactive terminal prompt for missing/invalid credentials, which
+# has nowhere to go from a background thread in a GUI app -- it just hangs
+# forever with no explanation. This makes git fail fast with a real error
+# instead, which every worker below then turns into a clear message.
+os.environ.setdefault("GIT_TERMINAL_PROMPT", "0")
+
 import platform
 import subprocess
 import webbrowser
@@ -21,19 +30,18 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QTextCursor, QFont, QIcon
 from PySide6.QtCore import Qt, QSettings
 
-import keyring
+from git import Repo, InvalidGitRepositoryError
+from git.exc import GitCommandError
 
 from clone_worker import CloneWorker
 from pull_worker import PullWorker
 from branch_worker import BranchListWorker
 from repo_registry import RepoRegistry, RepoStatusWorker
 from commit_push_worker import CommitPushWorker
-from settings_dialog import SettingsDialog
+from settings_dialog import SettingsDialog, load_all_tokens
 from git_providers import detect_provider
 from style import DARK_THEME
 
-KEYRING_SERVICE = "repo-clone-tool"
-KEYRING_USERNAME = "github-pat"
 MAX_RECENT = 8
 
 
@@ -46,23 +54,30 @@ def resource_path(relative_path):
 
 
 def open_in_file_manager(path):
-    """Opens a folder in the OS's file manager -- Explorer on Windows,
-    Finder on macOS, whatever the desktop's default is on Linux."""
+    """Opens a folder in the OS's file manager. Falls back to a plain
+    message instead of crashing if the expected command isn't present
+    (e.g. a minimal Linux install with no xdg-open) -- we can't fully
+    verify this on real macOS/Linux hardware, so failing safely here
+    matters more than usual."""
     system = platform.system()
-    if system == "Windows":
-        os.startfile(path)  # noqa: only exists on Windows, guarded by the check above
-    elif system == "Darwin":
-        subprocess.run(["open", path], check=False)
-    else:
-        subprocess.run(["xdg-open", path], check=False)
+    try:
+        if system == "Windows":
+            os.startfile(path)  # noqa: only exists on Windows, guarded above
+        elif system == "Darwin":
+            subprocess.run(["open", path], check=True)
+        else:
+            subprocess.run(["xdg-open", path], check=True)
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GitEase")
-        self.resize(880, 780)
-        self.setMinimumSize(680, 580)
+        self.resize(900, 800)
+        self.setMinimumSize(700, 600)
 
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path):
@@ -75,7 +90,8 @@ class MainWindow(QMainWindow):
         self.status_worker = None
         self._last_cloned_path = None
         self._detected_branches = []
-        self.current_token = ""
+        self.tokens = {}       # {"GitHub": "...", "GitLab": "...", "Bitbucket": "..."}
+        self._busy = False     # guards against overlapping clone/pull/push operations
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -145,7 +161,9 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumHeight(160)
         outer_layout.addWidget(self.log_view)
 
-        self._load_token_silently()
+        self.tokens = load_all_tokens()
+        if any(self.tokens.values()):
+            self.append_log("Loaded saved token(s) from the system keyring.")
         self._refresh_recent_combo()
         self._refresh_dashboard()
 
@@ -221,6 +239,12 @@ class MainWindow(QMainWindow):
         self.clone_btn.clicked.connect(self.start_clone)
         action_row.addWidget(self.clone_btn, stretch=3)
 
+        self.cancel_clone_btn = QPushButton("Cancel")
+        self.cancel_clone_btn.setMinimumHeight(42)
+        self.cancel_clone_btn.setVisible(False)
+        self.cancel_clone_btn.clicked.connect(self.cancel_current_operation)
+        action_row.addWidget(self.cancel_clone_btn, stretch=1)
+
         self.open_folder_btn = QPushButton("Open in Explorer")
         self.open_folder_btn.setMinimumHeight(42)
         self.open_folder_btn.setEnabled(False)
@@ -239,7 +263,9 @@ class MainWindow(QMainWindow):
         if provider == "Unknown":
             self.provider_label.setText("")
         else:
-            self.provider_label.setText(f"Detected: {provider}")
+            has_token = bool(self.tokens.get(provider))
+            suffix = " (token saved)" if has_token else " (no token saved)"
+            self.provider_label.setText(f"Detected: {provider}{suffix}")
 
     # ================= Pull tab =================
     def _build_pull_tab(self):
@@ -268,12 +294,26 @@ class MainWindow(QMainWindow):
         repo_row.addWidget(pull_browse_btn)
         layout.addLayout(repo_row)
 
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self.pull_btn = QPushButton("Pull Latest Changes")
         self.pull_btn.setObjectName("primaryButton")
         self.pull_btn.setMinimumHeight(42)
         self.pull_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pull_btn.clicked.connect(self.start_pull)
-        layout.addWidget(self.pull_btn)
+        action_row.addWidget(self.pull_btn, stretch=3)
+
+        self.cancel_pull_btn = QPushButton("Cancel")
+        self.cancel_pull_btn.setMinimumHeight(42)
+        self.cancel_pull_btn.setVisible(False)
+        self.cancel_pull_btn.clicked.connect(self.cancel_current_operation)
+        action_row.addWidget(self.cancel_pull_btn, stretch=1)
+        layout.addLayout(action_row)
+
+        abort_merge_btn = QPushButton("Abort In-Progress Merge (if a pull left a conflict)")
+        abort_merge_btn.setMinimumHeight(34)
+        abort_merge_btn.clicked.connect(self.abort_merge)
+        layout.addWidget(abort_merge_btn)
 
         layout.addStretch(1)
 
@@ -283,7 +323,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.setContentsMargins(4, 12, 4, 4)
 
-        info_label = QLabel("Every repo you've cloned with GitEase, at a glance.")
+        info_label = QLabel("Every repo you've cloned or added, at a glance.")
         info_label.setStyleSheet("color: #8b949e; font-weight: 400;")
         layout.addWidget(info_label)
 
@@ -310,11 +350,11 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_dashboard)
         btn_row.addWidget(refresh_btn)
 
-        pull_all_btn = QPushButton("Pull All")
-        pull_all_btn.setObjectName("primaryButton")
-        pull_all_btn.setMinimumHeight(38)
-        pull_all_btn.clicked.connect(self.pull_all_repos)
-        btn_row.addWidget(pull_all_btn)
+        self.pull_all_btn = QPushButton("Pull All")
+        self.pull_all_btn.setObjectName("primaryButton")
+        self.pull_all_btn.setMinimumHeight(38)
+        self.pull_all_btn.clicked.connect(self.pull_all_repos)
+        btn_row.addWidget(self.pull_all_btn)
 
         remove_btn = QPushButton("Remove Selected from List")
         remove_btn.setMinimumHeight(38)
@@ -354,12 +394,21 @@ class MainWindow(QMainWindow):
         self.commit_message_input.setMaximumHeight(90)
         layout.addWidget(self.commit_message_input)
 
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self.commit_push_btn = QPushButton("Stage All, Commit && Push")
         self.commit_push_btn.setObjectName("primaryButton")
         self.commit_push_btn.setMinimumHeight(42)
         self.commit_push_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.commit_push_btn.clicked.connect(self.start_commit_push)
-        layout.addWidget(self.commit_push_btn)
+        action_row.addWidget(self.commit_push_btn, stretch=3)
+
+        self.cancel_commit_btn = QPushButton("Cancel")
+        self.cancel_commit_btn.setMinimumHeight(42)
+        self.cancel_commit_btn.setVisible(False)
+        self.cancel_commit_btn.clicked.connect(self.cancel_current_operation)
+        action_row.addWidget(self.cancel_commit_btn, stretch=1)
+        layout.addLayout(action_row)
 
         layout.addStretch(1)
 
@@ -367,24 +416,80 @@ class MainWindow(QMainWindow):
         if self.tabs.widget(index) is self.dashboard_tab:
             self._refresh_dashboard()
 
-    # ---------------- Settings / token handling ----------------
-    def _load_token_silently(self):
-        try:
-            token = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
-            if token:
-                self.current_token = token
-                self.append_log("Loaded saved token from the system keyring.")
-        except Exception as e:
-            self.append_log(f"Could not load saved token: {e}")
+    # ---------------- Busy guard (prevents overlapping operations) ----------------
+    def _try_start_operation(self):
+        if self._busy:
+            QMessageBox.warning(
+                self, "Busy",
+                "Another operation is already running. Wait for it to finish, or "
+                "click Cancel on that tab first."
+            )
+            return False
+        self._busy = True
+        return True
 
+    def _end_operation(self):
+        self._busy = False
+
+    def cancel_current_operation(self):
+        if not self.worker or not self.worker.isRunning():
+            self._end_operation()
+            self._reset_action_buttons()
+            return
+        reply = QMessageBox.question(
+            self, "Cancel operation?",
+            "This forcefully stops the current git operation. It's a hard "
+            "interrupt, not a graceful stop -- check the repo's state "
+            "afterward (e.g. with Dashboard or Pull Latest) before assuming "
+            "everything is consistent. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.worker.terminate()
+        self.worker.wait(3000)
+        self.append_log("Operation cancelled by user (forced stop).")
+        self._end_operation()
+        self._reset_action_buttons()
+
+    def _reset_action_buttons(self):
+        self.clone_btn.setEnabled(True)
+        self.clone_btn.setText("Clone && Connect")
+        self.clone_progress.setVisible(False)
+        self.cancel_clone_btn.setVisible(False)
+
+        self.pull_btn.setEnabled(True)
+        self.pull_btn.setText("Pull Latest Changes")
+        self.cancel_pull_btn.setVisible(False)
+
+        self.commit_push_btn.setEnabled(True)
+        self.commit_push_btn.setText("Stage All, Commit && Push")
+        self.cancel_commit_btn.setVisible(False)
+
+    # ---------------- Settings / token handling ----------------
     def open_settings(self):
-        dialog = SettingsDialog(self.current_token, self)
-        dialog.token_changed.connect(self._on_token_changed)
+        dialog = SettingsDialog(self.tokens, self)
+        dialog.tokens_changed.connect(self._on_tokens_changed)
         dialog.exec()
 
-    def _on_token_changed(self, token):
-        self.current_token = token
-        self.append_log("Token updated.")
+    def _on_tokens_changed(self, tokens):
+        self.tokens = tokens
+        self.append_log("Token(s) updated.")
+        self._update_provider_label()
+
+    def _token_for_url(self, url):
+        provider = detect_provider(url)
+        return self.tokens.get(provider) or None
+
+    def _token_for_local_repo(self, path):
+        """Reads a local repo's origin URL (fast, no network) to figure out
+        which saved token applies to it, for pull/push/status operations."""
+        try:
+            repo = Repo(path)
+            provider = detect_provider(repo.remotes.origin.url)
+            return self.tokens.get(provider) or None
+        except Exception:
+            return None
 
     # ---------------- Branch listing ----------------
     def fetch_branches(self):
@@ -393,7 +498,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing URL", "Enter a repository URL first.")
             return
         self.append_log(f"Looking up branches for {url} ...")
-        self.branch_worker = BranchListWorker(url, self.current_token or None)
+        self.branch_worker = BranchListWorker(url, self._token_for_url(url))
         self.branch_worker.branches_ready.connect(self._on_branches_ready)
         self.branch_worker.failed.connect(self._on_branches_failed)
         self.branch_worker.start()
@@ -467,7 +572,13 @@ class MainWindow(QMainWindow):
 
     def open_last_cloned_folder(self):
         if self._last_cloned_path and os.path.isdir(self._last_cloned_path):
-            open_in_file_manager(self._last_cloned_path)
+            ok, err = open_in_file_manager(self._last_cloned_path)
+            if not ok:
+                QMessageBox.warning(
+                    self, "Couldn't open folder",
+                    f"GitEase couldn't open a file manager for this folder:\n{err}\n\n"
+                    f"You can navigate there manually:\n{self._last_cloned_path}"
+                )
         else:
             QMessageBox.warning(self, "No folder", "No successfully cloned folder to open yet.")
 
@@ -482,29 +593,34 @@ class MainWindow(QMainWindow):
 
     # ---------------- Clone flow ----------------
     def start_clone(self):
+        if not self._try_start_operation():
+            return
+
         url = self.url_input.text().strip()
         dest = self.dest_input.text().strip()
-        token = self.current_token or None
 
         branch = None
         if self.branch_combo.currentIndex() > 0:
             branch = self.branch_combo.currentText()
 
         if not url:
+            self._end_operation()
             QMessageBox.warning(self, "Missing URL", "Please enter a repository URL.")
             return
         if not dest:
+            self._end_operation()
             QMessageBox.warning(self, "Missing destination", "Please choose a destination folder.")
             return
 
         self.clone_btn.setEnabled(False)
         self.clone_btn.setText("Cloning...")
+        self.cancel_clone_btn.setVisible(True)
         self.clone_progress.setValue(0)
         self.clone_progress.setVisible(True)
         self.append_log("=" * 60)
         self.append_log(f"Clone requested: {url} -> {dest}")
 
-        self.worker = CloneWorker(url, dest, token, branch)
+        self.worker = CloneWorker(url, dest, self._token_for_url(url), branch)
         self.worker.log_message.connect(self.append_log)
         self.worker.progress_percent.connect(self.clone_progress.setValue)
         self.worker.finished_ok.connect(lambda path: self.on_clone_success(path, url))
@@ -512,9 +628,8 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_clone_success(self, path, url):
-        self.clone_btn.setEnabled(True)
-        self.clone_btn.setText("Clone && Connect")
-        self.clone_progress.setVisible(False)
+        self._end_operation()
+        self._reset_action_buttons()
         self._last_cloned_path = path
         self.open_folder_btn.setEnabled(True)
         self._add_recent_url(url)
@@ -523,9 +638,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Success", f"Repository cloned and connected at:\n{path}")
 
     def on_clone_failed(self, error_msg):
-        self.clone_btn.setEnabled(True)
-        self.clone_btn.setText("Clone && Connect")
-        self.clone_progress.setVisible(False)
+        self._end_operation()
+        self._reset_action_buttons()
         QMessageBox.critical(
             self, "Clone failed",
             f"Something went wrong:\n\n{error_msg}\n\nScroll the log above for full details."
@@ -533,37 +647,68 @@ class MainWindow(QMainWindow):
 
     # ---------------- Pull flow ----------------
     def start_pull(self):
+        if not self._try_start_operation():
+            return
+
         path = self.pull_path_input.text().strip()
         if not path:
+            self._end_operation()
             QMessageBox.warning(self, "Missing folder", "Please choose an existing repo folder.")
             return
 
         self.pull_btn.setEnabled(False)
         self.pull_btn.setText("Pulling...")
+        self.cancel_pull_btn.setVisible(True)
         self.append_log("=" * 60)
         self.append_log(f"Pull requested for: {path}")
 
-        self.worker = PullWorker(path)
+        self.worker = PullWorker(path, self._token_for_local_repo(path))
         self.worker.log_message.connect(self.append_log)
         self.worker.finished_ok.connect(self.on_pull_success)
         self.worker.failed.connect(self.on_pull_failed)
         self.worker.start()
 
     def on_pull_success(self, path, origin_url):
-        self.pull_btn.setEnabled(True)
-        self.pull_btn.setText("Pull Latest Changes")
+        self._end_operation()
+        self._reset_action_buttons()
         self.registry.add_path(path)
         if origin_url:
             self._add_recent_url(origin_url)
         QMessageBox.information(self, "Up to date", f"Pulled the latest changes into:\n{path}")
 
     def on_pull_failed(self, error_msg):
-        self.pull_btn.setEnabled(True)
-        self.pull_btn.setText("Pull Latest Changes")
+        self._end_operation()
+        self._reset_action_buttons()
         QMessageBox.critical(
             self, "Pull failed",
             f"Something went wrong:\n\n{error_msg}\n\nScroll the log above for full details."
         )
+
+    def abort_merge(self):
+        path = self.pull_path_input.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Missing folder", "Choose the repo folder first.")
+            return
+        reply = QMessageBox.question(
+            self, "Abort merge?",
+            "This discards the in-progress merge and any partially-resolved "
+            "changes from it. Your commits from before the pull are safe. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            repo = Repo(path)
+            repo.git.merge("--abort")
+            self.append_log(f"Merge aborted for {path}.")
+            QMessageBox.information(self, "Merge aborted", "The in-progress merge was aborted.")
+        except InvalidGitRepositoryError:
+            QMessageBox.warning(self, "Not a repo", "That folder isn't a git repository.")
+        except GitCommandError as e:
+            QMessageBox.warning(
+                self, "Nothing to abort",
+                f"Git couldn't abort a merge here -- there may not be one in progress:\n\n{e}"
+            )
 
     # ---------------- Dashboard ----------------
     def _refresh_dashboard(self):
@@ -583,7 +728,7 @@ class MainWindow(QMainWindow):
             return
 
         self.append_log(f"Checking status for {len(paths)} repo(s)...")
-        self.status_worker = RepoStatusWorker(paths)
+        self.status_worker = RepoStatusWorker(paths, self.tokens)
         self.status_worker.repo_status.connect(self._on_repo_status)
         self.status_worker.all_done.connect(lambda: self.append_log("Dashboard status check complete."))
         self.status_worker.start()
@@ -618,8 +763,11 @@ class MainWindow(QMainWindow):
         self.dashboard_table.setItem(row, 2, QTableWidgetItem(status_text))
 
     def pull_all_repos(self):
+        if not self._try_start_operation():
+            return
         paths = self.registry.get_paths()
         if not paths:
+            self._end_operation()
             QMessageBox.information(self, "Nothing to pull", "No repos tracked yet.")
             return
         self.append_log("=" * 60)
@@ -630,11 +778,12 @@ class MainWindow(QMainWindow):
     def _pull_next_in_queue(self):
         if not self._pull_all_queue:
             self.append_log("Pull All complete.")
+            self._end_operation()
             self._refresh_dashboard()
             return
         path = self._pull_all_queue.pop(0)
         self.append_log(f"Pulling: {path}")
-        worker = PullWorker(path)
+        worker = PullWorker(path, self._token_for_local_repo(path))
         worker.log_message.connect(self.append_log)
         worker.finished_ok.connect(lambda _p, _u: self._pull_next_in_queue())
         worker.failed.connect(lambda _msg: self._pull_next_in_queue())
@@ -668,36 +817,42 @@ class MainWindow(QMainWindow):
 
     # ---------------- Commit & push flow ----------------
     def start_commit_push(self):
+        if not self._try_start_operation():
+            return
+
         path = self.commit_path_input.text().strip()
         message = self.commit_message_input.toPlainText().strip()
 
         if not path:
+            self._end_operation()
             QMessageBox.warning(self, "Missing folder", "Please choose a repo folder.")
             return
         if not message:
+            self._end_operation()
             QMessageBox.warning(self, "Missing message", "Please enter a commit message.")
             return
 
         self.commit_push_btn.setEnabled(False)
         self.commit_push_btn.setText("Working...")
+        self.cancel_commit_btn.setVisible(True)
         self.append_log("=" * 60)
         self.append_log(f"Commit && push requested for: {path}")
 
-        self.worker = CommitPushWorker(path, message)
+        self.worker = CommitPushWorker(path, message, self._token_for_local_repo(path))
         self.worker.log_message.connect(self.append_log)
         self.worker.finished_ok.connect(self.on_commit_push_success)
         self.worker.failed.connect(self.on_commit_push_failed)
         self.worker.start()
 
     def on_commit_push_success(self, summary):
-        self.commit_push_btn.setEnabled(True)
-        self.commit_push_btn.setText("Stage All, Commit && Push")
+        self._end_operation()
+        self._reset_action_buttons()
         self.commit_message_input.clear()
         QMessageBox.information(self, "Done", summary)
 
     def on_commit_push_failed(self, error_msg):
-        self.commit_push_btn.setEnabled(True)
-        self.commit_push_btn.setText("Stage All, Commit && Push")
+        self._end_operation()
+        self._reset_action_buttons()
         QMessageBox.critical(
             self, "Commit/push failed",
             f"Something went wrong:\n\n{error_msg}\n\nScroll the log above for full details."

@@ -13,6 +13,8 @@ from PySide6.QtCore import QThread, Signal, QSettings
 from git import Repo, InvalidGitRepositoryError
 from git.exc import GitCommandError
 
+from git_providers import detect_provider, temporarily_authed_remote
+
 SETTINGS_ORG = "GitEase"
 SETTINGS_APP = "GitEase"
 REGISTRY_KEY = "cloned_repo_paths"
@@ -58,9 +60,10 @@ class RepoStatusWorker(QThread):
     repo_status = Signal(str, dict)   # path, {branch, ahead, behind, error}
     all_done = Signal()
 
-    def __init__(self, paths):
+    def __init__(self, paths, tokens=None):
         super().__init__()
         self.paths = paths
+        self.tokens = tokens or {}  # {"GitHub": "...", "GitLab": "...", "Bitbucket": "..."}
 
     def run(self):
         for path in self.paths:
@@ -70,7 +73,11 @@ class RepoStatusWorker(QThread):
                 branch = repo.active_branch.name
                 info["branch"] = branch
 
-                repo.remotes.origin.fetch()
+                provider = detect_provider(repo.remotes.origin.url)
+                token = self.tokens.get(provider)
+
+                with temporarily_authed_remote(repo, token) as origin:
+                    origin.fetch()
 
                 upstream_ref = f"origin/{branch}"
                 # If there's no upstream tracking branch on the remote (e.g. a
@@ -89,7 +96,11 @@ class RepoStatusWorker(QThread):
             except InvalidGitRepositoryError:
                 info["error"] = "Not a git repository"
             except GitCommandError as e:
-                info["error"] = str(e)
+                msg = str(e)
+                for tok in self.tokens.values():
+                    if tok:
+                        msg = msg.replace(tok, "****")
+                info["error"] = msg
             except Exception as e:
                 info["error"] = str(e)
 

@@ -119,8 +119,13 @@ def test_commit_push_stages_commits_and_pushes(mock_repo_cls):
     push_info = MagicMock()
     push_info.summary = "main -> main"
     push_info.flags = 0
-    push_info.ERROR = 1 << 10  # any nonzero bit that won't match flags=0
+    push_info.ERROR = 1 << 10       # bits that won't match flags=0
+    push_info.REJECTED = 1 << 11
     mock_repo.remotes.origin.push.return_value = [push_info]
+    # temporarily_authed_remote uses repo.remotes["origin"] (subscript),
+    # same as real GitPython's IterableList -- MagicMock needs this wired
+    # explicitly since it doesn't auto-support __getitem__.
+    mock_repo.remotes.__getitem__.return_value = mock_repo.remotes.origin
     mock_repo_cls.return_value = mock_repo
 
     worker, _ = make_commit_worker(message="Fix bug")

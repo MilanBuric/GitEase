@@ -16,6 +16,7 @@ works for most self-hosted git servers) for anything unrecognized.
 SSH URLs and URLs with no token are returned unchanged.
 """
 
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 # domain substring -> username to pair with the token
@@ -68,3 +69,30 @@ def build_authed_url(url, token):
     if username:
         return url.replace("https://", f"https://{username}:{token}@", 1)
     return url.replace("https://", f"https://{token}@", 1)
+
+
+@contextmanager
+def temporarily_authed_remote(repo, token, remote_name="origin"):
+    """Temporarily rewrites a remote's URL to embed a token for the
+    duration of exactly one git network operation (pull/push/fetch),
+    then always restores the original, token-free URL afterward --
+    even if the operation raises. This is what keeps a token from
+    ending up sitting in plaintext in .git/config permanently: it's
+    only ever there for the few seconds a real network call is in
+    flight, never at rest.
+
+    If there's no token, or the remote is SSH-based (so build_authed_url
+    would leave it unchanged), this is a no-op passthrough."""
+    remote = repo.remotes[remote_name]
+    original_url = remote.url
+    authed_url = build_authed_url(original_url, token) if token else original_url
+
+    if authed_url == original_url:
+        yield remote
+        return
+
+    remote.set_url(authed_url)
+    try:
+        yield remote
+    finally:
+        remote.set_url(original_url)
