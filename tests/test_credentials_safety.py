@@ -97,3 +97,33 @@ def test_clone_strips_token_from_stored_remote(mock_clone_from):
     assert mock_repo.remotes.origin.url == "https://github.com/user/repo.git"
     # And nothing logged should contain the raw token either.
     assert not any("SECRETTOKEN" in str(entry) for entry in worker.log_message.emitted)
+
+
+# ---------------- Progress bar monotonic guard ----------------
+
+def test_progress_bar_never_regresses_even_for_unknown_stage():
+    """Regression test: an earlier version of _STAGE_WEIGHTS didn't cover
+    every op-code GitPython can report (WRITING and FINDING_SOURCES were
+    missing), which could make the bar visibly jump backward mid-clone.
+    The monotonic floor added to fix that must hold for ANY stage code,
+    including ones this table has never seen."""
+    from clone_worker import CloneProgress
+    from git import RemoteProgress
+
+    log_sig, pct_sig = DummySignal(), DummySignal()
+    cp = CloneProgress(log_sig, pct_sig)
+
+    sequence = [
+        (RemoteProgress.COUNTING, 100, 100),
+        (RemoteProgress.RECEIVING, 1000, 1000),
+        (RemoteProgress.RESOLVING, 60, 60),
+        (9999, 1, 100),  # a stage code the weight table has never heard of
+        (RemoteProgress.CHECKING_OUT, 10, 10),
+    ]
+    for op, cur, mx in sequence:
+        cp.update(op, cur, mx)
+
+    values = pct_sig.emitted
+    assert all(values[i] <= values[i + 1] for i in range(len(values) - 1)), (
+        f"progress bar regressed: {values}"
+    )

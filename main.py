@@ -40,6 +40,7 @@ from repo_registry import RepoRegistry, RepoStatusWorker
 from commit_push_worker import CommitPushWorker
 from settings_dialog import SettingsDialog, load_all_tokens
 from git_providers import detect_provider
+from repo_safety import find_stale_lock_files, remove_lock_files
 from style import DARK_THEME
 
 MAX_RECENT = 8
@@ -92,6 +93,7 @@ class MainWindow(QMainWindow):
         self._detected_branches = []
         self.tokens = {}       # {"GitHub": "...", "GitLab": "...", "Bitbucket": "..."}
         self._busy = False     # guards against overlapping clone/pull/push operations
+        self._current_operation_path = None  # repo path the active operation is working in
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -451,6 +453,47 @@ class MainWindow(QMainWindow):
         self.append_log("Operation cancelled by user (forced stop).")
         self._end_operation()
         self._reset_action_buttons()
+        self._check_for_stale_locks(self._current_operation_path)
+
+    def _check_for_stale_locks(self, repo_path):
+        """After a forced cancel, checks whether git left a *.lock marker
+        file behind mid-write. If so, offers to remove it immediately --
+        since GitEase just killed the only process that could have owned
+        it, it's safe to clear, and leaving it in place would silently
+        block every future git operation on this repo with a confusing
+        error until someone finds and deletes it by hand."""
+        if not repo_path:
+            return
+        locks = find_stale_lock_files(repo_path)
+        if not locks:
+            return
+
+        names = "\n".join(os.path.relpath(p, repo_path) for p in locks)
+        reply = QMessageBox.question(
+            self, "Leftover lock file(s) found",
+            f"Cancelling left {len(locks)} lock file(s) behind in this repo:\n\n{names}\n\n"
+            "These block every future git operation here until removed. Since GitEase "
+            "just stopped the only process that could have been using them, it should "
+            "be safe to delete them now. Remove them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.append_log(
+                f"Left {len(locks)} lock file(s) in place -- future git operations on "
+                "this repo may fail until they're removed manually."
+            )
+            return
+
+        removed, failed = remove_lock_files(locks)
+        if removed:
+            self.append_log(f"Removed {len(removed)} leftover lock file(s).")
+        if failed:
+            failed_names = "\n".join(f"{p} ({err})" for p, err in failed)
+            self.append_log(f"Could not remove {len(failed)} lock file(s).")
+            QMessageBox.warning(
+                self, "Some lock files couldn't be removed",
+                f"These lock files need to be deleted manually:\n\n{failed_names}"
+            )
 
     def _reset_action_buttons(self):
         self.clone_btn.setEnabled(True)
@@ -617,6 +660,7 @@ class MainWindow(QMainWindow):
         self.cancel_clone_btn.setVisible(True)
         self.clone_progress.setValue(0)
         self.clone_progress.setVisible(True)
+        self._current_operation_path = dest
         self.append_log("=" * 60)
         self.append_log(f"Clone requested: {url} -> {dest}")
 
@@ -659,6 +703,7 @@ class MainWindow(QMainWindow):
         self.pull_btn.setEnabled(False)
         self.pull_btn.setText("Pulling...")
         self.cancel_pull_btn.setVisible(True)
+        self._current_operation_path = path
         self.append_log("=" * 60)
         self.append_log(f"Pull requested for: {path}")
 
@@ -782,6 +827,7 @@ class MainWindow(QMainWindow):
             self._refresh_dashboard()
             return
         path = self._pull_all_queue.pop(0)
+        self._current_operation_path = path
         self.append_log(f"Pulling: {path}")
         worker = PullWorker(path, self._token_for_local_repo(path))
         worker.log_message.connect(self.append_log)
@@ -835,6 +881,7 @@ class MainWindow(QMainWindow):
         self.commit_push_btn.setEnabled(False)
         self.commit_push_btn.setText("Working...")
         self.cancel_commit_btn.setVisible(True)
+        self._current_operation_path = path
         self.append_log("=" * 60)
         self.append_log(f"Commit && push requested for: {path}")
 

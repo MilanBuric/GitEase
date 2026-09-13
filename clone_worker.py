@@ -25,11 +25,17 @@ from git_providers import build_authed_url
 
 # Rough weight of each clone phase, summing to 100. Receiving objects is
 # usually the slowest (network-bound) phase, so it gets the most room.
+# All seven of GitPython's known op-codes are covered on purpose: leaving
+# any out meant an unweighted phase fell back to a 0-100 range of its own,
+# which could make the bar visibly jump backward mid-clone -- exactly the
+# "resetting" problem this weighting exists to prevent.
 _STAGE_WEIGHTS = {
     RemoteProgress.COUNTING: (0, 5),
     RemoteProgress.COMPRESSING: (5, 10),
-    RemoteProgress.RECEIVING: (15, 65),
-    RemoteProgress.RESOLVING: (80, 15),
+    RemoteProgress.WRITING: (15, 10),
+    RemoteProgress.RECEIVING: (25, 45),
+    RemoteProgress.FINDING_SOURCES: (70, 5),
+    RemoteProgress.RESOLVING: (75, 20),
     RemoteProgress.CHECKING_OUT: (95, 5),
 }
 
@@ -42,6 +48,8 @@ class CloneProgress(RemoteProgress):
         super().__init__()
         self.log_signal = log_signal
         self.percent_signal = percent_signal
+        self._max_percent_seen = 0  # belt-and-suspenders: never let the bar go backward,
+                                     # even for a stage this table somehow doesn't cover
 
     def update(self, op_code, cur_count, max_count=None, message=""):
         if message:
@@ -54,8 +62,12 @@ class CloneProgress(RemoteProgress):
             stage = op_code & self.OP_MASK
             start, weight = _STAGE_WEIGHTS.get(stage, (0, 100))
             stage_fraction = min(cur_count / max_count, 1.0) if max_count else 0
-            overall = start + stage_fraction * weight
-            self.percent_signal.emit(int(min(overall, 99)))  # 100 is reserved for true completion
+            overall = int(min(start + stage_fraction * weight, 99))  # 100 is reserved for true completion
+            # Never let the bar visibly move backward, even if a stage this
+            # table doesn't recognize computes a lower value than we've
+            # already shown -- climbing steadily is the whole point.
+            self._max_percent_seen = max(self._max_percent_seen, overall)
+            self.percent_signal.emit(self._max_percent_seen)
 
     def line_dropped(self, line):
         self.log_signal.emit(line)
