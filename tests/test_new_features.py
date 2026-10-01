@@ -122,6 +122,10 @@ def test_commit_push_stages_commits_and_pushes(mock_repo_cls):
     push_info.ERROR = 1 << 10       # bits that won't match flags=0
     push_info.REJECTED = 1 << 11
     mock_repo.remotes.origin.push.return_value = [push_info]
+    # A real repo's remote always has a real string URL -- temporarily_authed_remote
+    # now inspects it (to check for/heal a stale embedded token) even when no
+    # new token is being applied, so the mock needs one too.
+    mock_repo.remotes.origin.url = "https://github.com/user/repo.git"
     # temporarily_authed_remote uses repo.remotes["origin"] (subscript),
     # same as real GitPython's IterableList -- MagicMock needs this wired
     # explicitly since it doesn't auto-support __getitem__.

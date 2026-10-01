@@ -14,7 +14,7 @@ from PySide6.QtCore import QThread, Signal
 from git import Repo, InvalidGitRepositoryError
 from git.exc import GitCommandError
 
-from git_providers import temporarily_authed_remote
+from git_providers import temporarily_authed_remote, strip_existing_credentials
 
 
 class PullWorker(QThread):
@@ -44,9 +44,16 @@ class PullWorker(QThread):
                     "git will stop and report a conflict if it can't merge cleanly."
                 )
 
-            clean_url = repo.remotes.origin.url
+            # Never assume the stored URL is already clean -- a repo cloned by
+            # an older, pre-credential-safety build of GitEase can have a
+            # token permanently baked into its origin URL. Strip it explicitly
+            # before it's ever used in a log line, regardless of the repo's
+            # history. (temporarily_authed_remote below also self-heals the
+            # URL actually stored in .git/config -- this is specifically
+            # about what reaches the log.)
+            safe_log_url = strip_existing_credentials(repo.remotes.origin.url)
             with temporarily_authed_remote(repo, self.token) as origin:
-                self.log_message.emit(f"Pulling from {clean_url} ...")
+                self.log_message.emit(f"Pulling from {safe_log_url} ...")
                 pull_info = origin.pull()
 
             for info in pull_info:

@@ -14,13 +14,13 @@ Paste a repo URL, pick a destination folder, and click **Clone & Connect**. GitE
 
 - **A separate saved token per provider.** Settings has one token field for GitHub, one for GitLab, and one for Bitbucket, each stored independently. You can have private repos on all three at once without one token overwriting another.
 
-- **Tokens are never left sitting in plaintext.** A token is only ever embedded in a repo's remote URL for the few seconds an actual clone, pull, push, or status-check network call is in flight. The instant that call finishes — whether it succeeds or fails — the clean, token-free URL is restored. Nothing sensitive is left behind in `.git/config` afterward.
+- **Tokens are never left sitting in plaintext.** A token is only ever embedded in a repo's remote URL for the few seconds an actual clone, pull, push, or status-check network call is in flight. The instant that call finishes — whether it succeeds or fails — the clean, token-free URL is restored. Nothing sensitive is left behind in `.git/config` afterward. This is also **self-healing**: a repo cloned by an older build of GitEase (from before this protection existed) can have a token permanently baked into its stored URL — the next time GitEase touches that repo, the stale token is detected and stripped automatically, converging the repo to clean.
 
 - **Clear, specific error messages instead of silent hangs.** If git needs interactive credentials it has no way to ask for from a background thread, GitEase fails fast with an explanation rather than freezing indefinitely. If a pull hits a merge conflict, or a push is rejected because someone else pushed first, you get a plain-English explanation of what happened and what to do next — not a raw git stack trace.
 
 - **Abort a stuck merge** right from the Pull tab if a pull ever leaves you mid-conflict, without needing to open a terminal.
 
-- **Cancel button** on Clone, Pull, and Commit && Push. Stops a hung or unwanted operation. This is a hard interrupt (not a graceful stop), and GitEase says so plainly when you use it, with a reminder to double-check the repo's state afterward.
+- **Cancel button** on Clone, Pull, and Commit && Push. Stops a hung or unwanted operation. This is a hard interrupt (not a graceful stop), and GitEase says so plainly when you use it. If the interrupt leaves a stale `.lock` file behind in the repo — the classic side effect of killing git mid-write, which otherwise silently blocks every future operation there — GitEase detects it immediately afterward and offers to clean it up for you.
 
 - **Only one operation runs at a time.** Trying to start a second clone/pull/push while one is already in progress is blocked with a clear message, instead of letting two operations silently step on each other.
 
@@ -101,12 +101,13 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-24 tests across 5 files, covering:
+35 tests across 6 files, covering:
 
 - Clone logic (`test_clone_worker.py`)
 - Branch listing and commit/push logic (`test_new_features.py`)
 - Provider detection and auth-URL formatting for GitHub/GitLab/Bitbucket (`test_git_providers.py`)
-- Credential safety (`test_credential_safety.py`) — including a test that deliberately raises an exception mid-operation and confirms the token-free URL is still restored, proving the fix holds under failure, not just the happy path.
+- Credential safety (`test_credential_safety.py`) — including a test that deliberately raises an exception mid-operation and confirms the token-free URL is still restored, proving the fix holds under failure, not just the happy path; also covers the clone progress bar's monotonic guard.
+- Stale lock-file recovery after a cancelled operation (`test_repo_safety.py`)
 
 All git, network, and Qt calls are mocked, so the full suite runs in a fraction of a second with no real repos, network calls, or windows involved.
 
@@ -147,7 +148,8 @@ GitEase/
 │   ├── test_clone_worker.py     # Clone logic: token injection, empty-folder check, success/failure paths
 │   ├── test_new_features.py      # Branch listing and commit/push logic
 │   ├── test_git_providers.py      # GitHub/GitLab/Bitbucket URL auth-format detection
-│   └── test_credential_safety.py   # Proves tokens are never left behind, even when an operation fails
+│   ├── test_credential_safety.py   # Proves tokens are never left behind, even when an operation fails
+│   └── test_repo_safety.py          # Stale .lock file detection/cleanup after a cancelled operation
 ├── main.py                          # App entry point and main window: 4 tabs, header, log panel,
 │                                     # busy-operation guard, cancel handling, merge-abort action
 ├── clone_worker.py                   # Background thread: clones a repo, optional branch, weighted
@@ -165,6 +167,8 @@ GitEase/
 │                                     # -formatted authenticated URL for that host, and provides the
 │                                     # temporarily_authed_remote context manager used everywhere a
 │                                     # git network call needs a token without persisting it
+├── repo_safety.py                            # Detects and safely removes stale .lock files left behind
+│                                     # by a forcefully-cancelled operation
 ├── style.py                                  # Dark theme stylesheet (QSS)
 ├── icon.ico / icon.png                        # App icon (Windows/Linux window icon and taskbar/dock icon)
 ├── build.bat                                   # Builds a standalone Windows .exe via PyInstaller
@@ -189,7 +193,7 @@ GitEase/
 These are deliberate, documented scope boundaries rather than bugs or oversights:
 
 - **No merge-conflict resolution UI.** GitEase detects a conflict clearly and can abort a stuck merge, but it doesn't provide any way to resolve conflicting files from within the app — that still requires a text editor or terminal.
-- **Cancel is a hard interrupt, not a graceful stop.** Cancelling mid-operation can leave a git operation partway done. Always check the repo's state afterward — via the Dashboard tab, or by trying Pull Latest again — rather than assuming everything is consistent.
+- **Cancel is a hard interrupt, not a graceful stop.** Cancelling mid-operation can leave a git operation partway done. If it leaves a stale `*.lock` file behind — the most common side effect of interrupting git mid-write — GitEase detects it automatically right after the cancel and offers to remove it. Still, always check the repo's state afterward (Dashboard, or Pull Latest) rather than assuming everything else is consistent.
 - **"Sign in with GitHub" is GitHub-specific.** GitLab and Bitbucket don't have an equivalent one-click sign-in in GitEase; both always use a manually-entered token.
 - **The prebuilt Windows executable is unsigned.** Windows SmartScreen may show a "Windows protected your PC" warning the first time you run it, since it isn't signed with a paid code-signing certificate.
 - **No macOS app icon (`.icns`) is included yet.** `icon.ico` covers the Windows and Linux window icon. `build.sh` will automatically use an `icon.icns` file if you add one to the project root, but one isn't provided out of the box.

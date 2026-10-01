@@ -127,3 +127,73 @@ def test_progress_bar_never_regresses_even_for_unknown_stage():
     assert all(values[i] <= values[i + 1] for i in range(len(values) - 1)), (
         f"progress bar regressed: {values}"
     )
+
+
+# ---------------- Double-credential / stale-token healing ----------------
+# Regression coverage for a real bug: a repo cloned by an older,
+# pre-credential-safety build of GitEase can have a token permanently
+# baked into its stored origin URL. Applying a new token on top of that
+# used to produce a doubly-credentialed URL (https://new@old@host/...),
+# which git/curl reject outright, AND which leaked the old token into
+# the log the next time that URL was read for display purposes.
+
+def test_build_authed_url_strips_existing_token_before_adding_new_one():
+    from git_providers import build_authed_url
+
+    already_dirty_url = "https://gho_OLDTOKEN123@github.com/user/repo.git"
+    result = build_authed_url(already_dirty_url, "gho_NEWTOKEN456")
+
+    assert "OLDTOKEN123" not in result
+    assert result.count("gho_NEWTOKEN456") == 1
+    assert result.count("@") == 1
+    assert result == "https://gho_NEWTOKEN456@github.com/user/repo.git"
+
+
+def test_strip_existing_credentials_leaves_clean_url_unchanged():
+    from git_providers import strip_existing_credentials
+
+    clean = "https://github.com/user/repo.git"
+    assert strip_existing_credentials(clean) == clean
+
+
+def test_strip_existing_credentials_ignores_ssh_urls():
+    from git_providers import strip_existing_credentials
+
+    # git@host:path is legitimate SSH syntax, not a credential to strip
+    ssh_url = "git@github.com:user/repo.git"
+    assert strip_existing_credentials(ssh_url) == ssh_url
+
+
+def test_temporarily_authed_remote_self_heals_a_dirty_stored_url():
+    """The core fix: a repo whose remote already has a stale token baked
+    in must end up with a fully clean URL in .git/config after any
+    operation goes through temporarily_authed_remote -- not just during
+    that one operation, but persisted afterward too."""
+    from git_providers import temporarily_authed_remote
+
+    repo, remote = _make_mock_repo(
+        "https://gho_OLDTOKEN123@github.com/user/repo.git"
+    )
+    with temporarily_authed_remote(repo, "gho_NEWTOKEN456") as r:
+        assert "OLDTOKEN123" not in r.url
+        assert r.url == "https://gho_NEWTOKEN456@github.com/user/repo.git"
+
+    assert remote.url == "https://github.com/user/repo.git"
+    assert "OLDTOKEN123" not in remote.url
+    assert "NEWTOKEN456" not in remote.url
+
+
+def test_temporarily_authed_remote_heals_dirty_url_even_with_no_token():
+    """A dirty stored URL should get cleaned up even on an operation that
+    isn't applying any new token at all (e.g. a public repo pulled with
+    no token configured, but which still has an old one baked in from
+    before the fix existed)."""
+    from git_providers import temporarily_authed_remote
+
+    repo, remote = _make_mock_repo(
+        "https://gho_OLDTOKEN123@github.com/user/repo.git"
+    )
+    with temporarily_authed_remote(repo, None) as r:
+        assert r.url == "https://github.com/user/repo.git"
+
+    assert remote.url == "https://github.com/user/repo.git"
